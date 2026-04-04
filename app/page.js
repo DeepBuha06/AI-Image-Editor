@@ -8,7 +8,7 @@ export default function Page() {
     const [imageDataUrl, setImageDataUrl] = useState(null);
     const [targetObject, setTargetObject] = useState("");
     const [editPrompt, setEditPrompt] = useState("");
-    const [editStrength, setEditStrength] = useState(1.0);
+    const [editStrength, setEditStrength] = useState(0.95);
     const [isProcessing, setIsProcessing] = useState(false);
     const [resultImage, setResultImage] = useState(null);
     const [brushSize, setBrushSize] = useState(30);
@@ -25,17 +25,42 @@ export default function Page() {
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (ev) => {
-            const dataUrl = ev.target.result;
-            setImageDataUrl(dataUrl);
-            setResultImage(null);
-            pathsRef.current = [];
-
+            const rawDataUrl = ev.target.result;
             const img = new Image();
             img.onload = () => {
-                imgRef.current = img;
-                if (mode === "brush") drawCanvasWithImage(img);
+                let width = img.naturalWidth;
+                let height = img.naturalHeight;
+                const MAX_SIZE = 1024;
+
+                if (width > MAX_SIZE || height > MAX_SIZE) {
+                    if (width > height) {
+                        height = Math.round((height * MAX_SIZE) / width);
+                        width = MAX_SIZE;
+                    } else {
+                        width = Math.round((width * MAX_SIZE) / height);
+                        height = MAX_SIZE;
+                    }
+                }
+
+                const tempCanvas = document.createElement("canvas");
+                tempCanvas.width = width;
+                tempCanvas.height = height;
+                const ctx = tempCanvas.getContext("2d");
+                ctx.drawImage(img, 0, 0, width, height);
+                const resizedDataUrl = tempCanvas.toDataURL("image/png");
+
+                setImageDataUrl(resizedDataUrl);
+                setResultImage(null);
+                pathsRef.current = [];
+
+                const resizedImg = new Image();
+                resizedImg.onload = () => {
+                    imgRef.current = resizedImg;
+                    if (mode === "brush") drawCanvasWithImage(resizedImg);
+                };
+                resizedImg.src = resizedDataUrl;
             };
-            img.src = dataUrl;
+            img.src = rawDataUrl;
         };
         reader.readAsDataURL(file);
     };
@@ -239,10 +264,10 @@ export default function Page() {
                 {mode === "auto" && (
                     <div>
                         <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">2 · What to select?</span>
-                        <input type="text" placeholder="e.g. 'the shirt', 'the car'"
+                        <input type="text" placeholder="shirt" maxLength={30}
                             value={targetObject} onChange={(e) => setTargetObject(e.target.value)}
                             className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500/40 placeholder:text-neutral-600" />
-                        <p className="text-[10px] text-neutral-500 mt-1">GroundingDINO + SAM2 will mask it automatically.</p>
+                        <p className="text-[10px] text-neutral-500 mt-1">⚠️ Object name ONLY (e.g. <strong>shirt</strong>, <strong>car</strong>, <strong>sky</strong>). NOT a sentence.</p>
                     </div>
                 )}
 
@@ -268,7 +293,7 @@ export default function Page() {
                 {/* Prompt */}
                 <div>
                     <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">3 · Edit instruction</span>
-                    <textarea placeholder={mode === "auto" ? "e.g. 'a bright red shirt'" : "e.g. 'a leather cowboy hat'"}
+                    <textarea placeholder={mode === "auto" ? "e.g. 'a bright red shirt, same fabric texture'" : "e.g. 'a leather cowboy hat'"}
                         value={editPrompt} onChange={(e) => setEditPrompt(e.target.value)} rows={2}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/40 resize-none placeholder:text-neutral-600" />
                 </div>

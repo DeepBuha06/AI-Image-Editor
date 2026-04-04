@@ -80,72 +80,177 @@ async function uploadImage(base64Data, filename) {
     return response.json();
 }
 
-function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength = 1.0) {
+function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength = 0.95) {
+    const enhancedPositive = `${editPrompt}, highly detailed, sharp focus, professional photo, 8k, photorealistic, consistent lighting`;
+    const negativePrompt = "blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise";
+
     return {
-        "1": { class_type: "LoadImage", inputs: { image: imageName } },
-        "2": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sd-v1-5-inpainting.ckpt" } },
-        "3": { class_type: "CLIPTextEncode", inputs: { text: `${editPrompt}, high quality, detailed, photorealistic`, clip: ["2", 1] } },
-        "4": { class_type: "CLIPTextEncode", inputs: { text: "blurry, duplicate, deformed, ugly, bad anatomy, bad lighting", clip: ["2", 1] } },
-        "5": { class_type: "SAM2ModelLoader (segment anything2)", inputs: { model_name: "sam2_1_hiera_base_plus.pt" } },
-        "6": { class_type: "GroundingDinoModelLoader (segment anything2)", inputs: { model_name: "GroundingDINO_SwinT_OGC (694MB)" } },
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["1", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "3": {
+            class_type: "CheckpointLoaderSimple",
+            inputs: { ckpt_name: "sd_xl_base_1.0_inpainting_0.1.safetensors" }
+        },
+        "4": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: enhancedPositive, clip: ["3", 1] }
+        },
+        "5": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: negativePrompt, clip: ["3", 1] }
+        },
+        "6": {
+            class_type: "SAM2ModelLoader (segment anything2)",
+            inputs: { model_name: "sam2_1_hiera_base_plus.pt" }
+        },
         "7": {
+            class_type: "GroundingDinoModelLoader (segment anything2)",
+            inputs: { model_name: "GroundingDINO_SwinT_OGC (694MB)" }
+        },
+        "8": {
             class_type: "GroundingDinoSAM2Segment (segment anything2)",
             inputs: {
-                sam_model: ["5", 0],
-                grounding_dino_model: ["6", 0],
-                image: ["1", 0],
+                sam_model: ["6", 0],
+                grounding_dino_model: ["7", 0],
+                image: ["2", 0],        // scaled image, not raw
                 prompt: targetObject,
                 threshold: 0.3,
                 keep_model_loaded: false,
             },
         },
-        "8": {
-            class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["1", 0], vae: ["2", 2], mask: ["7", 1], grow_mask_by: 6 },
-        },
         "9": {
+            class_type: "VAEEncodeForInpaint",
+            inputs: {
+                pixels: ["2", 0],       // scaled image
+                vae: ["3", 2],
+                mask: ["8", 1],         // SAM2 mask output
+                grow_mask_by: 8,
+            },
+        },
+        "10": {
             class_type: "KSampler",
             inputs: {
-                model: ["2", 0], positive: ["3", 0], negative: ["4", 0], latent_image: ["8", 0],
-                seed: Math.floor(Math.random() * 1000000000), steps: 30, cfg: 8.0, sampler_name: "euler", scheduler: "normal",
+                model: ["3", 0],
+                positive: ["4", 0],
+                negative: ["5", 0],
+                latent_image: ["9", 0],
+                seed: Math.floor(Math.random() * 1000000000),
+                steps: 40,
+                cfg: 7.0,
+                sampler_name: "dpmpp_2m",
+                scheduler: "karras",
                 denoise: editStrength,
             },
         },
-        "10": { class_type: "VAEDecode", inputs: { samples: ["9", 0], vae: ["2", 2] } },
         "11": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["1", 0], source: ["10", 0], mask: ["7", 1], x: 0, y: 0, resize_source: false },
+            class_type: "VAEDecode",
+            inputs: { samples: ["10", 0], vae: ["3", 2] }
         },
-        "12": { class_type: "SaveImage", inputs: { images: ["11", 0], filename_prefix: "pixxel_final" } },
+        "12": {
+            class_type: "SaveImage",
+            inputs: { images: ["11", 0], filename_prefix: "pixxel_final" }
+        },
     };
 }
 
-function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength = 1.0) {
+function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength = 0.95) {
+    const enhancedPositive = `${editPrompt}, highly detailed, sharp focus, professional photo, 8k, photorealistic, consistent lighting`;
+    const negativePrompt = "blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise";
+
     return {
-        "1": { class_type: "LoadImage", inputs: { image: imageName } },
-        "2": { class_type: "LoadImage", inputs: { image: maskName } },
-        "3": { class_type: "ImageToMask", inputs: { image: ["2", 0], channel: "red" } },
-        "4": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sd-v1-5-inpainting.ckpt" } },
-        "5": { class_type: "CLIPTextEncode", inputs: { text: `${editPrompt}, high quality, detailed, photorealistic`, clip: ["4", 1] } },
-        "6": { class_type: "CLIPTextEncode", inputs: { text: "blurry, duplicate, deformed, ugly, bad anatomy, bad lighting", clip: ["4", 1] } },
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "LoadImage",
+            inputs: { image: maskName }
+        },
+        "3": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["1", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "4": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["2", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "5": {
+            class_type: "ImageToMask",
+            inputs: { image: ["4", 0], channel: "red" }
+        },
+        "6": {
+            class_type: "CheckpointLoaderSimple",
+            inputs: { ckpt_name: "sd_xl_base_1.0_inpainting_0.1.safetensors" }
+        },
         "7": {
-            class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["1", 0], vae: ["4", 2], mask: ["3", 0], grow_mask_by: 6 },
+            class_type: "CLIPTextEncode",
+            inputs: { text: enhancedPositive, clip: ["6", 1] }
         },
         "8": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: negativePrompt, clip: ["6", 1] }
+        },
+        "9": {
+            class_type: "VAEEncode",
+            inputs: {
+                pixels: ["3", 0],   // scaled image (use ["2",0] for GroundingDino workflow)
+                vae: ["6", 2],      // (use ["3",2] for GroundingDino workflow)
+            },
+        },
+        "9b": {
+            class_type: "SetLatentNoiseMask",
+            inputs: {
+                samples: ["9", 0],
+                mask: ["5", 0],     // your mask node output (use ["8",1] for GroundingDino workflow)
+            },
+        },
+        "10": {
             class_type: "KSampler",
             inputs: {
-                model: ["4", 0], positive: ["5", 0], negative: ["6", 0], latent_image: ["7", 0],
-                seed: Math.floor(Math.random() * 1000000000), steps: 30, cfg: 8.0, sampler_name: "euler", scheduler: "normal",
+                model: ["6", 0],
+                positive: ["7", 0],
+                negative: ["8", 0],
+                latent_image: ["9b", 0],
+                seed: Math.floor(Math.random() * 1000000000),
+                steps: 40,
+                cfg: 7.0,
+                sampler_name: "dpmpp_2m",
+                scheduler: "karras",
                 denoise: editStrength,
             },
         },
-        "9": { class_type: "VAEDecode", inputs: { samples: ["8", 0], vae: ["4", 2] } },
-        "10": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["1", 0], source: ["9", 0], mask: ["3", 0], x: 0, y: 0, resize_source: false },
+        "11": {
+            class_type: "VAEDecode",
+            inputs: { samples: ["10", 0], vae: ["6", 2] }
         },
-        "11": { class_type: "SaveImage", inputs: { images: ["10", 0], filename_prefix: "pixxel_final" } },
+        "12": {
+            class_type: "SaveImage",
+            inputs: { images: ["11", 0], filename_prefix: "pixxel_final" }
+        },
     };
 }
 
@@ -163,11 +268,11 @@ export async function POST(request) {
         let workflow;
         if (mode === "auto") {
             if (!targetObject) return NextResponse.json({ error: "targetObject required for auto mode" }, { status: 400 });
-            workflow = buildGroundingDinoWorkflow(imageResult.name, targetObject, editPrompt, editStrength || 1.0);
+            workflow = buildGroundingDinoWorkflow(imageResult.name, targetObject, editPrompt, editStrength || 0.95);
         } else {
             if (!mask) return NextResponse.json({ error: "mask required for brush mode" }, { status: 400 });
             const maskResult = await uploadImage(mask, `pixxel_mask_${timestamp}.png`);
-            workflow = buildManualBrushWorkflow(imageResult.name, maskResult.name, editPrompt, editStrength || 1.0);
+            workflow = buildManualBrushWorkflow(imageResult.name, maskResult.name, editPrompt, editStrength || 0.95);
         }
 
         const { prompt_id } = await submitWorkflow(workflow);
