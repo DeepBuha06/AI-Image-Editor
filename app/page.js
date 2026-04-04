@@ -5,6 +5,7 @@ import { Upload, Sparkles, Loader2, Paintbrush, ScanSearch, Undo2 } from "lucide
 
 export default function Page() {
     const [mode, setMode] = useState("auto");
+    const [intentDebug, setIntentDebug] = useState(null);
     const [imageDataUrl, setImageDataUrl] = useState(null);
     const [targetObject, setTargetObject] = useState("");
     const [editPrompt, setEditPrompt] = useState("");
@@ -183,10 +184,6 @@ export default function Page() {
             alert("Upload an image and enter an edit instruction.");
             return;
         }
-        if (mode === "auto" && !targetObject) {
-            alert("Enter the object to select in 'What to select?'");
-            return;
-        }
         if (mode === "brush" && pathsRef.current.length === 0) {
             alert("Draw on the image to mark where to edit.");
             return;
@@ -194,20 +191,54 @@ export default function Page() {
 
         setIsProcessing(true);
         try {
-            const body = {
-                mode,
-                image: imageDataUrl,
-                editPrompt,
-                editStrength,
-            };
+            const maskData = mode === "brush" ? extractMask() : undefined;
 
-            if (mode === "auto") {
-                body.targetObject = targetObject;
+            const intentRes = await fetch("/api/intent", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: editPrompt, modeHint: mode }),
+            });
+            const intentData = await intentRes.json();
+            if (!intentRes.ok) throw new Error(intentData.error || "Intent routing failed");
+
+            setIntentDebug(intentData);
+
+            let endpoint = intentData.route || "/api/comfyui";
+            let body;
+
+            if (endpoint === "/api/removal") {
+                body = {
+                    mode,
+                    image: imageDataUrl,
+                    targetObject: mode === "auto" ? (targetObject || editPrompt) : undefined,
+                    mask: mode === "brush" ? maskData : undefined,
+                };
+            } else if (endpoint === "/api/fusion") {
+                body = {
+                    image: imageDataUrl,
+                    addPrompt: editPrompt,
+                    placementHint: targetObject || undefined,
+                    mask: mode === "brush" ? maskData : undefined,
+                };
             } else {
-                body.mask = extractMask();
+                endpoint = "/api/comfyui";
+                body = {
+                    mode,
+                    image: imageDataUrl,
+                    editPrompt,
+                    editStrength,
+                    targetObject: mode === "auto" ? targetObject : undefined,
+                    mask: mode === "brush" ? maskData : undefined,
+                };
+
+                if (mode === "auto" && !body.targetObject) {
+                    alert("Enter the object to select in 'What to select?' for auto edit mode.");
+                    setIsProcessing(false);
+                    return;
+                }
             }
 
-            const res = await fetch("/api/comfyui", {
+            const res = await fetch(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -226,7 +257,7 @@ export default function Page() {
     return (
         <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-row p-6 gap-6 font-sans">
             {/* ───── Sidebar ───── */}
-            <div className="w-[400px] shrink-0 flex flex-col gap-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-5 shadow-2xl overflow-y-auto max-h-screen">
+            <div className="w-100 shrink-0 flex flex-col gap-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-5 shadow-2xl overflow-y-auto max-h-screen">
                 <div className="flex items-center gap-3">
                     <Sparkles className="text-cyan-400 w-6 h-6" />
                     <h1 className="text-xl font-bold tracking-tight">PIXXEL AI</h1>
@@ -314,11 +345,17 @@ export default function Page() {
 
                 {/* Execute */}
                 <button onClick={handleExecute}
-                    disabled={!imageDataUrl || !editPrompt || isProcessing || (mode === "auto" && !targetObject)}
-                    className="w-full bg-gradient-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 shadow-lg transition flex items-center justify-center gap-2 mt-auto">
+                    disabled={!imageDataUrl || !editPrompt || isProcessing}
+                    className="w-full bg-linear-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 shadow-lg transition flex items-center justify-center gap-2 mt-auto">
                     {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-4 h-4" />}
                     {isProcessing ? "Processing…" : "Run AI Edit"}
                 </button>
+
+                {intentDebug && (
+                    <p className="text-[10px] text-neutral-500 mt-1">
+                        Routed via {intentDebug.provider}: <strong>{intentDebug.intent}</strong>{" -> "}<strong>{intentDebug.route}</strong>
+                    </p>
+                )}
             </div>
 
             {/* ───── Canvas Area ───── */}
