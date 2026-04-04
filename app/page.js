@@ -1,10 +1,16 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Upload, Sparkles, Loader2, Paintbrush, ScanSearch, Undo2 } from "lucide-react";
+import { Upload, Sparkles, Loader2, CheckCircle2, CopyPlus, Undo2 } from "lucide-react";
+
+import ModeSelector from "./components/ModeSelector";
+import PromptBar from "./components/PromptBar";
+import SketchCanvas from "./components/SketchCanvas";
+import BeforeAfter from "./components/BeforeAfter";
+import EditHistory from "./components/EditHistory";
 
 export default function Page() {
-    const [mode, setMode] = useState("auto");
+    const [mode, setMode] = useState("edit");
     const [imageDataUrl, setImageDataUrl] = useState(null);
     const [targetObject, setTargetObject] = useState("");
     const [editPrompt, setEditPrompt] = useState("");
@@ -12,14 +18,16 @@ export default function Page() {
     const [isProcessing, setIsProcessing] = useState(false);
     const [resultImage, setResultImage] = useState(null);
     const [brushSize, setBrushSize] = useState(30);
+    const [history, setHistory] = useState([]);
+    const [confidenceBadge, setConfidenceBadge] = useState("");
 
-    // For brush mode: we draw on a native canvas, no Fabric.js at all
     const canvasRef = useRef(null);
     const isDrawing = useRef(false);
-    const imgRef = useRef(null); // holds the HTMLImageElement for the uploaded photo
-    const pathsRef = useRef([]); // stores drawn paths for undo
+    const imgRef = useRef(null);
+    const pathsRef = useRef([]);
+    const sketchCanvasRef = useRef(null);
 
-    // Load the uploaded image into an HTMLImageElement
+    // Load the uploaded image into an HTMLImageElement + Downscale
     const handleImageUpload = (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -51,12 +59,15 @@ export default function Page() {
 
                 setImageDataUrl(resizedDataUrl);
                 setResultImage(null);
+                setHistory([]);
                 pathsRef.current = [];
 
                 const resizedImg = new Image();
                 resizedImg.onload = () => {
                     imgRef.current = resizedImg;
-                    if (mode === "brush") drawCanvasWithImage(resizedImg);
+                    if (mode === "edit" || mode === "remove" || mode === "fusion") {
+                        drawCanvasWithImage(resizedImg);
+                    }
                 };
                 resizedImg.src = resizedDataUrl;
             };
@@ -65,7 +76,6 @@ export default function Page() {
         reader.readAsDataURL(file);
     };
 
-    // Draw the base image onto the canvas (brush mode)
     const drawCanvasWithImage = useCallback((img) => {
         const canvas = canvasRef.current;
         if (!canvas || !img) return;
@@ -74,7 +84,6 @@ export default function Page() {
         const ctx = canvas.getContext("2d");
         ctx.drawImage(img, 0, 0);
 
-        // Redraw all existing brush strokes on top
         for (const path of pathsRef.current) {
             ctx.strokeStyle = "rgba(255, 0, 0, 0.5)";
             ctx.lineWidth = path.size;
@@ -90,15 +99,12 @@ export default function Page() {
         }
     }, []);
 
-    // When switching to brush mode or image changes, redraw
     useEffect(() => {
-        if (mode === "brush" && imgRef.current) {
-            // Small delay to ensure canvas DOM is rendered
+        if (imgRef.current && mode !== "sketch") {
             setTimeout(() => drawCanvasWithImage(imgRef.current), 50);
         }
     }, [mode, imageDataUrl, drawCanvasWithImage]);
 
-    // --- Brush drawing handlers ---
     const getCanvasCoords = (e) => {
         const canvas = canvasRef.current;
         if (!canvas) return { x: 0, y: 0 };
@@ -123,7 +129,6 @@ export default function Page() {
         const currentPath = pathsRef.current[pathsRef.current.length - 1];
         currentPath.points.push(p);
 
-        // Draw incrementally
         const canvas = canvasRef.current;
         const ctx = canvas.getContext("2d");
         ctx.strokeStyle = "rgba(255, 0, 0, 0.5)";
@@ -148,20 +153,17 @@ export default function Page() {
         if (imgRef.current) drawCanvasWithImage(imgRef.current);
     };
 
-    // Extract a black-and-white mask from drawn paths
     const extractMask = () => {
         const img = imgRef.current;
-        if (!img) return null;
+        if (!img || pathsRef.current.length === 0) return null;
         const offscreen = document.createElement("canvas");
         offscreen.width = img.naturalWidth;
         offscreen.height = img.naturalHeight;
         const ctx = offscreen.getContext("2d");
 
-        // Black background = untouched areas
         ctx.fillStyle = "black";
         ctx.fillRect(0, 0, offscreen.width, offscreen.height);
 
-        // White strokes = areas to inpaint
         for (const path of pathsRef.current) {
             ctx.strokeStyle = "white";
             ctx.lineWidth = path.size;
@@ -178,43 +180,91 @@ export default function Page() {
         return offscreen.toDataURL("image/png");
     };
 
+    const handleAutoDetect = async (promptText) => {
+        setIsProcessing(true);
+        try {
+            const res = await fetch("/api/intent", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ prompt: promptText })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Intent detection failed");
+
+            let newMode = "edit";
+            if (data.type === "object_removal") newMode = "remove";
+            else if (data.type === "object_fusion") newMode = "fusion";
+            else if (data.type === "sketch_to_object") newMode = "sketch";
+
+            setMode(newMode);
+            if (data.targetObject) setTargetObject(data.targetObject);
+
+            setConfidenceBadge(`Auto-detected: ${Math.round(data.confidence * 100)}% confidence`);
+            setTimeout(() => setConfidenceBadge(""), 4000);
+
+        } catch (err) {
+            alert(err.message || "Intent detection failed.");
+        } finally {
+            setIsProcessing(false);
+        }
+    };
+
     const handleExecute = async () => {
         if (!imageDataUrl || !editPrompt) {
             alert("Upload an image and enter an edit instruction.");
             return;
         }
-        if (mode === "auto" && !targetObject) {
-            alert("Enter the object to select in 'What to select?'");
-            return;
-        }
-        if (mode === "brush" && pathsRef.current.length === 0) {
-            alert("Draw on the image to mark where to edit.");
-            return;
-        }
 
         setIsProcessing(true);
         try {
-            const body = {
-                mode,
-                image: imageDataUrl,
-                editPrompt,
-                editStrength,
-            };
+            const body = { image: imageDataUrl, editPrompt };
+            let endpoint = "/api/comfyui";
 
-            if (mode === "auto") {
-                body.targetObject = targetObject;
-            } else {
+            if (mode === "edit") {
+                body.mode = pathsRef.current.length ? "brush" : "auto";
+                body.editStrength = editStrength;
+                if (body.mode === "auto") {
+                    if (!targetObject.trim()) throw new Error("Please enter an Auto Target Object manually or draw a brush mask.");
+                    body.targetObject = targetObject;
+                } else {
+                    body.mask = extractMask();
+                }
+            } else if (mode === "remove") {
+                endpoint = "/api/removal";
+                body.mode = pathsRef.current.length ? "brush" : "auto";
                 body.mask = extractMask();
+                if (body.mode === "auto") {
+                    if (!targetObject.trim()) throw new Error("Please enter an Auto Target Object manually or draw a brush mask.");
+                    body.targetObject = targetObject;
+                }
+            } else if (mode === "fusion") {
+                endpoint = "/api/fusion";
+                body.mode = "fusion";
+                body.addPrompt = editPrompt;
+                body.placementHint = ""; // Required payload argument
+                body.mask = extractMask();
+            } else if (mode === "sketch") {
+                endpoint = "/api/sketch";
+                body.mode = "sketch";
+                const sketchB64 = sketchCanvasRef.current?.getSketch();
+                if (!sketchB64) throw new Error("Please draw a sketch first");
+                body.sketch = sketchB64;
+                body.sketchPrompt = editPrompt;
             }
 
-            const res = await fetch("/api/comfyui", {
+            const res = await fetch(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
             });
+
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || "Processing failed");
-            setResultImage(data.image);
+
+            const finalResponseImage = data.image || data.result;
+
+            setResultImage(finalResponseImage);
+            setHistory(prev => [{ prompt: editPrompt, image: finalResponseImage }, ...prev].slice(0, 5));
         } catch (err) {
             alert(err.message);
             console.error(err);
@@ -223,153 +273,152 @@ export default function Page() {
         }
     };
 
+    const handleUseResultAsNewInput = () => {
+        if (!resultImage) return;
+        setImageDataUrl(resultImage);
+        setResultImage(null);
+        pathsRef.current = [];
+        const img = new Image();
+        img.onload = () => {
+            imgRef.current = img;
+            if (mode !== "sketch") drawCanvasWithImage(img);
+        };
+        img.src = resultImage;
+    };
+
+    const handleRestoreHistory = (historicalImg) => {
+        setResultImage(historicalImg);
+    };
+
     return (
         <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-row p-6 gap-6 font-sans">
             {/* ───── Sidebar ───── */}
-            <div className="w-[400px] shrink-0 flex flex-col gap-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-5 shadow-2xl overflow-y-auto max-h-screen">
+            <div className="w-[400px] shrink-0 flex flex-col gap-5 bg-neutral-900 border border-neutral-800 rounded-2xl p-5 shadow-2xl overflow-y-auto max-h-screen custom-scrollbar">
                 <div className="flex items-center gap-3">
                     <Sparkles className="text-cyan-400 w-6 h-6" />
                     <h1 className="text-xl font-bold tracking-tight">PIXXEL AI</h1>
+                    {confidenceBadge && (
+                        <span className="ml-auto flex items-center gap-1 text-[9px] bg-green-500/20 text-green-400 px-2 py-1 rounded border border-green-500/30">
+                            <CheckCircle2 className="w-3 h-3" /> {confidenceBadge}
+                        </span>
+                    )}
                 </div>
 
-                {/* Mode Toggle */}
-                <div className="pt-3 border-t border-neutral-800">
-                    <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1.5 block">Mode</span>
-                    <div className="flex bg-neutral-950 rounded-lg p-1 border border-neutral-800">
-                        <button onClick={() => setMode("auto")}
-                            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-md transition ${mode === "auto" ? "bg-cyan-900/50 text-cyan-400" : "text-neutral-500 hover:text-neutral-300"}`}>
-                            <ScanSearch className="w-3.5 h-3.5" /> Auto Select
-                        </button>
-                        <button onClick={() => setMode("brush")}
-                            className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-md transition ${mode === "brush" ? "bg-purple-900/50 text-purple-400" : "text-neutral-500 hover:text-neutral-300"}`}>
-                            <Paintbrush className="w-3.5 h-3.5" /> Brush
-                        </button>
-                    </div>
-                    <p className="text-[10px] text-neutral-500 mt-1.5">
-                        {mode === "auto" ? "AI finds & masks objects for you. Best for editing existing things." : "You paint the mask. Best for adding objects to empty space."}
-                    </p>
-                </div>
+                <ModeSelector selectedMode={mode} onModeChange={setMode} />
 
-                {/* Upload */}
                 <div>
-                    <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">1 · Image</span>
+                    <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">2 · Image Base</span>
                     <label htmlFor="pixxel-upload" className="flex items-center justify-center w-full h-16 bg-neutral-950 border-2 border-dashed border-neutral-700 rounded-xl cursor-pointer hover:border-cyan-500/50 transition">
                         <Upload className="w-4 h-4 text-neutral-500 mr-2" />
-                        <span className="text-sm text-neutral-400">{imageDataUrl ? "Change image" : "Upload image"}</span>
+                        <span className="text-sm text-neutral-400">{imageDataUrl ? "Change base image" : "Upload image"}</span>
                     </label>
                     <input id="pixxel-upload" type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                 </div>
 
-                {/* Auto: target object */}
-                {mode === "auto" && (
+                {(mode === "edit" || mode === "remove" || mode === "fusion") && (
+                    <div className="flex items-center gap-3 bg-neutral-950 p-2 rounded-lg border border-neutral-800">
+                        <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">Mask Brush Layer</span>
+                        <input type="range" min="5" max="100" value={brushSize}
+                            onChange={(e) => setBrushSize(parseInt(e.target.value))}
+                            className="flex-1 accent-purple-500" />
+                        <button onClick={handleUndo} title="Undo stroke"
+                            className="p-1 rounded-md bg-neutral-800 hover:bg-neutral-700 transition">
+                            <Undo2 className="w-3.5 h-3.5 text-neutral-300" />
+                        </button>
+                    </div>
+                )}
+
+                {(mode === "edit" || mode === "remove") && (
                     <div>
-                        <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">2 · What to select?</span>
-                        <input type="text" placeholder="shirt" maxLength={30}
+                        <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">Auto Target Object</span>
+                        <input type="text" placeholder="Object name (e.g. shirt, car)" maxLength={30}
                             value={targetObject} onChange={(e) => setTargetObject(e.target.value)}
                             className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500/40 placeholder:text-neutral-600" />
-                        <p className="text-[10px] text-neutral-500 mt-1">⚠️ Object name ONLY (e.g. <strong>shirt</strong>, <strong>car</strong>, <strong>sky</strong>). NOT a sentence.</p>
                     </div>
                 )}
 
-                {/* Brush: controls */}
-                {mode === "brush" && (
+                <PromptBar
+                    editPrompt={editPrompt}
+                    setEditPrompt={setEditPrompt}
+                    selectedMode={mode}
+                    onAutoDetect={handleAutoDetect}
+                />
+
+                {mode === "edit" && (
                     <div>
-                        <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">2 · Draw mask</span>
-                        <div className="flex items-center gap-3">
-                            <span className="text-xs text-neutral-400 shrink-0">Size</span>
-                            <input type="range" min="5" max="100" value={brushSize}
-                                onChange={(e) => setBrushSize(parseInt(e.target.value))}
-                                className="flex-1 accent-purple-500" />
-                            <span className="text-xs text-purple-400 font-mono w-6 text-right">{brushSize}</span>
-                            <button onClick={handleUndo} title="Undo last stroke"
-                                className="p-1.5 rounded-md bg-neutral-800 hover:bg-neutral-700 text-neutral-300 transition">
-                                <Undo2 className="w-3.5 h-3.5" />
-                            </button>
+                        <div className="flex justify-between items-center mb-1">
+                            <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">Edit Strength</span>
+                            <span className="text-xs text-cyan-400 font-mono">{editStrength.toFixed(2)}</span>
                         </div>
-                        <p className="text-[10px] text-neutral-500 mt-1">Paint red on the preview canvas where you want the AI to generate.</p>
+                        <input type="range" min="0.3" max="1.0" step="0.05" value={editStrength}
+                            onChange={(e) => setEditStrength(parseFloat(e.target.value))}
+                            className="w-full accent-cyan-500" />
                     </div>
                 )}
 
-                {/* Prompt */}
-                <div>
-                    <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider mb-1 block">3 · Edit instruction</span>
-                    <textarea placeholder={mode === "auto" ? "e.g. 'a bright red shirt, same fabric texture'" : "e.g. 'a leather cowboy hat'"}
-                        value={editPrompt} onChange={(e) => setEditPrompt(e.target.value)} rows={2}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/40 resize-none placeholder:text-neutral-600" />
-                </div>
+                <EditHistory history={history} onRestore={handleRestoreHistory} />
 
-                {/* Strength */}
-                <div>
-                    <div className="flex justify-between items-center mb-1">
-                        <span className="text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">4 · Strength</span>
-                        <span className="text-xs text-cyan-400 font-mono">{editStrength.toFixed(2)}</span>
-                    </div>
-                    <input type="range" min="0.3" max="1.0" step="0.05" value={editStrength}
-                        onChange={(e) => setEditStrength(parseFloat(e.target.value))}
-                        className="w-full accent-cyan-500" />
-                    <div className="flex justify-between text-[10px] text-neutral-500 mt-0.5 px-0.5">
-                        <span>Recolor</span><span>Replace</span>
-                    </div>
-                </div>
+                <div className="mt-auto flex flex-col gap-2">
+                    <button onClick={handleExecute}
+                        disabled={!imageDataUrl || !editPrompt || isProcessing}
+                        className="w-full bg-gradient-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 shadow-lg transition flex items-center justify-center gap-2">
+                        {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                        {isProcessing ? "Processing…" : `Run ${mode} Edit`}
+                    </button>
 
-                {/* Execute */}
-                <button onClick={handleExecute}
-                    disabled={!imageDataUrl || !editPrompt || isProcessing || (mode === "auto" && !targetObject)}
-                    className="w-full bg-gradient-to-r from-cyan-600 to-purple-600 hover:from-cyan-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg px-4 py-3 shadow-lg transition flex items-center justify-center gap-2 mt-auto">
-                    {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                    {isProcessing ? "Processing…" : "Run AI Edit"}
-                </button>
+                    {resultImage && (
+                        <button onClick={handleUseResultAsNewInput}
+                            className="w-full bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-semibold rounded-lg px-4 py-2 transition flex items-center justify-center gap-2">
+                            <CopyPlus className="w-3.5 h-3.5" /> Use Result As New Base
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* ───── Canvas Area ───── */}
-            <div className="flex-1 flex gap-4 min-h-0 overflow-hidden">
-                {/* Left: Original / Brush canvas */}
-                <div className="flex-1 bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col overflow-hidden relative">
-                    <span className="absolute top-3 left-3 z-10 bg-black/60 text-white text-[10px] font-bold px-2 py-1 rounded backdrop-blur-sm">
-                        {mode === "brush" ? "DRAW MASK HERE" : "ORIGINAL"}
-                    </span>
-                    <div className="flex-1 flex items-center justify-center p-4 overflow-hidden">
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative border border-neutral-800 rounded-2xl bg-neutral-900 border-dashed">
+                {resultImage ? (
+                    <BeforeAfter originalSrc={imageDataUrl} resultSrc={resultImage} />
+                ) : (
+                    <div className="flex-1 flex items-center justify-center p-4 relative overflow-hidden">
                         {!imageDataUrl ? (
                             <span className="text-neutral-600 text-sm">Upload an image to start</span>
-                        ) : mode === "auto" ? (
-                            /* Auto mode: just show the image, no canvas needed */
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={imageDataUrl} alt="Original" className="max-w-full max-h-full object-contain rounded-lg" />
                         ) : (
-                            /* Brush mode: native canvas for drawing */
-                            <canvas
-                                ref={canvasRef}
-                                onPointerDown={onPointerDown}
-                                onPointerMove={onPointerMove}
-                                onPointerUp={onPointerUp}
-                                onPointerLeave={onPointerUp}
-                                className="max-w-full max-h-full object-contain rounded-lg cursor-crosshair"
-                                style={{ touchAction: "none" }}
-                            />
-                        )}
-                    </div>
-                </div>
-
-                {/* Right: Result */}
-                <div className="flex-1 bg-neutral-900 border border-cyan-900/30 rounded-2xl flex flex-col overflow-hidden relative">
-                    <span className="absolute top-3 left-3 z-10 bg-cyan-900/50 text-cyan-200 text-[10px] font-bold px-2 py-1 rounded backdrop-blur-sm">
-                        RESULT
-                    </span>
-                    <div className="flex-1 flex items-center justify-center p-4">
-                        {resultImage ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={resultImage} alt="Result" className="max-w-full max-h-full object-contain rounded-lg" />
-                        ) : isProcessing ? (
-                            <div className="flex flex-col items-center gap-3">
-                                <Loader2 className="w-8 h-8 text-cyan-500 animate-spin" />
-                                <span className="text-xs text-cyan-500/80">Segmenting & Inpainting…</span>
+                            <div className="relative inline-block max-w-full max-h-full">
+                                {mode === "sketch" ? (
+                                    <>
+                                        <img src={imageDataUrl} alt="Base" className="max-w-full max-h-full object-contain rounded-lg opacity-40" />
+                                        <SketchCanvas ref={sketchCanvasRef} baseImageWidth={imgRef.current?.naturalWidth} baseImageHeight={imgRef.current?.naturalHeight} />
+                                    </>
+                                ) : (
+                                    <canvas
+                                        ref={canvasRef}
+                                        onPointerDown={onPointerDown}
+                                        onPointerMove={onPointerMove}
+                                        onPointerUp={onPointerUp}
+                                        onPointerLeave={onPointerUp}
+                                        className="max-w-full max-h-full object-contain rounded-lg cursor-crosshair"
+                                        style={{ touchAction: "none" }}
+                                    />
+                                )}
                             </div>
-                        ) : (
-                            <span className="text-neutral-600 text-sm">Result will appear here</span>
+                        )}
+                        {isProcessing && (
+                            <div className="absolute inset-0 bg-black/60 flex items-center justify-center backdrop-blur-sm z-50">
+                                <div className="flex flex-col items-center gap-3">
+                                    <Loader2 className="w-8 h-8 text-cyan-500 animate-spin" />
+                                    <span className="text-xs text-cyan-500/80 uppercase tracking-widest">Generating…</span>
+                                </div>
+                            </div>
                         )}
                     </div>
-                </div>
+                )}
             </div>
+            <style jsx global>{`
+                .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+                .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+                .custom-scrollbar::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; }
+            `}</style>
         </div>
     );
 }

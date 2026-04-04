@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-const COMFYUI_URL = process.env.NEXT_PUBLIC_COMFYUI_URL || "http://localhost:8189";
+const COMFYUI_URL = process.env.NEXT_PUBLIC_COMFYUI_URL || "http://10.0.62.179:8189";
 
 async function submitWorkflow(workflow) {
     const response = await fetch(`${COMFYUI_URL}/prompt`, {
