@@ -113,10 +113,10 @@ export async function POST(req) {
         };
 
         const promptId = await submitWorkflow(prompt);
-        const resultFilename = await waitForResult(promptId);
-        const finalImageBase64 = await getResultImage(resultFilename);
+        const resultInfo = await waitForResult(promptId);
+        const finalImageBase64 = await getResultImage(resultInfo.filename, resultInfo.subfolder, resultInfo.type);
 
-        return NextResponse.json({ success: true, result: finalImageBase64 });
+        return NextResponse.json({ success: true, image: finalImageBase64 });
 
     } catch (err) {
         console.error("Sketch API Error:", err);

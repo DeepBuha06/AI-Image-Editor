@@ -88,8 +88,8 @@ export async function POST(req) {
                 "images": ["2", 0],
                 "masks": [maskSourceNode, maskIndex],
                 "invert_mask": false,
-                "mask_threshold": 0.5,
-                "gaussblur_radius": 0
+                "mask_threshold": 200,
+                "gaussblur_radius": 4
             }
         };
 
@@ -103,11 +103,11 @@ export async function POST(req) {
         };
 
         // Execute the workflow
-        const promptId = await submitWorkflow(prompt);
-        const resultFilename = await waitForResult(promptId);
-        const finalImageBase64 = await getResultImage(resultFilename);
+        const prompt_id = await submitWorkflow(prompt);
+        const resultInfo = await waitForResult(prompt_id);
+        const finalImage = await getResultImage(resultInfo.filename, resultInfo.subfolder, resultInfo.type);
 
-        return NextResponse.json({ success: true, result: finalImageBase64 });
+        return NextResponse.json({ success: true, image: finalImage });
 
     } catch (err) {
         console.error("Removal API Error:", err);
