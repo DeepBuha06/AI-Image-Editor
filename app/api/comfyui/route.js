@@ -80,9 +80,72 @@ async function uploadImage(base64Data, filename) {
     return response.json();
 }
 
-function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength = 0.95) {
-    const enhancedPositive = `${editPrompt}, highly detailed, sharp focus, professional photo, 8k, photorealistic, consistent lighting`;
-    const negativePrompt = "blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise";
+async function analyzeImageWithFlorence(imageName) {
+    const workflow = {
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "Florence2ModelLoader",
+            inputs: {
+                model_name: "microsoft/Florence-2-base",
+                precision: "fp16",
+                attention: "sdpa"
+            }
+        },
+        "3": {
+            class_type: "Florence2Run",
+            inputs: {
+                image: ["1", 0],
+                florence2_model: ["2", 0],
+                task: "<DETAILED_CAPTION>",
+                text_input: "",
+                max_new_tokens: 1024,
+                num_beams: 3,
+                do_sample: false,
+                output_mask_select: ""
+            }
+        }
+    };
+
+    try {
+        const COMFYUI_URL = process.env.NEXT_PUBLIC_COMFYUI_URL || "http://10.0.62.179:8189";
+        const response = await fetch(`${COMFYUI_URL}/prompt`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: workflow }),
+        });
+        const { prompt_id } = await response.json();
+
+        // Poll for result
+        const startTime = Date.now();
+        while (Date.now() - startTime < 30000) {
+            const histRes = await fetch(`${COMFYUI_URL}/history/${prompt_id}`);
+            const history = await histRes.json();
+            if (history[prompt_id]) {
+                const outputs = history[prompt_id].outputs;
+                for (const nodeId of Object.keys(outputs)) {
+                    if (outputs[nodeId].text) {
+                        return outputs[nodeId].text[0] || "";
+                    }
+                }
+                return "";
+            }
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        return "";
+    } catch {
+        return "";
+    }
+}
+
+function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength = 0.95, imageDescription = "") {
+    const contextHint = imageDescription
+        ? `same person as described: ${imageDescription.slice(0, 200)}, `
+        : "";
+    const enhancedPositive = `${editPrompt}, full outfit change, entire clothing replaced, ${contextHint}same person, same pose, same background, photorealistic, highly detailed, sharp focus, professional photo, 8k, consistent lighting`;
+    const negativePrompt = `different person, different face, different body type, blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise, artifacts`;
 
     return {
         "1": {
@@ -136,7 +199,7 @@ function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStr
                 pixels: ["2", 0],       // scaled image
                 vae: ["3", 2],
                 mask: ["8", 1],         // SAM2 mask output
-                grow_mask_by: 8,
+                grow_mask_by: 24,   // was 8, now 24 for full outfit coverage
             },
         },
         "10": {
@@ -165,9 +228,12 @@ function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStr
     };
 }
 
-function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength = 0.95) {
-    const enhancedPositive = `${editPrompt}, highly detailed, sharp focus, professional photo, 8k, photorealistic, consistent lighting`;
-    const negativePrompt = "blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise";
+function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength = 0.95, imageDescription = "") {
+    const contextHint = imageDescription
+        ? `same person as described: ${imageDescription.slice(0, 200)}, `
+        : "";
+    const enhancedPositive = `${editPrompt}, full outfit change, entire clothing replaced, ${contextHint}same person, same pose, same background, photorealistic, highly detailed, sharp focus, professional photo, 8k, consistent lighting`;
+    const negativePrompt = `different person, different face, different body type, blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise, artifacts`;
 
     return {
         "1": {
@@ -265,14 +331,23 @@ export async function POST(request) {
         const timestamp = Date.now();
         const imageResult = await uploadImage(image, `pixxel_input_${timestamp}.png`);
 
+        // Auto-analyze image for context-aware prompting
+        const imageDescription = await analyzeImageWithFlorence(imageResult.name);
+
         let workflow;
         if (mode === "auto") {
             if (!targetObject) return NextResponse.json({ error: "targetObject required for auto mode" }, { status: 400 });
-            workflow = buildGroundingDinoWorkflow(imageResult.name, targetObject, editPrompt, editStrength || 0.95);
+            workflow = buildGroundingDinoWorkflow(
+                imageResult.name, targetObject, editPrompt,
+                editStrength || 0.95, imageDescription
+            );
         } else {
             if (!mask) return NextResponse.json({ error: "mask required for brush mode" }, { status: 400 });
             const maskResult = await uploadImage(mask, `pixxel_mask_${timestamp}.png`);
-            workflow = buildManualBrushWorkflow(imageResult.name, maskResult.name, editPrompt, editStrength || 0.95);
+            workflow = buildManualBrushWorkflow(
+                imageResult.name, maskResult.name, editPrompt,
+                editStrength || 0.95, imageDescription
+            );
         }
 
         const { prompt_id } = await submitWorkflow(workflow);
