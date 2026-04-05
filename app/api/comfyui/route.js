@@ -1,309 +1,322 @@
 import { NextResponse } from "next/server";
-import {
-    getResultImage,
-    submitWorkflow,
-    uploadImage,
-    waitForResult,
-} from "../../../lib/comfyui";
 
-// ─── Intent Parser ────────────────────────────────────────────────────────────
+const COMFYUI_URL = process.env.NEXT_PUBLIC_COMFYUI_URL || "http://10.0.62.179:8189";
 
-function parseEditIntent(editPrompt) {
-    const lower = editPrompt.toLowerCase();
-    if (/remove|delete|erase|eliminate|get rid of|clean up/.test(lower)) return "remove";
-    if (/add|place|put|insert|include/.test(lower))                       return "add";
-    if (/replace|change|swap|turn|make it/.test(lower))                   return "replace";
-    return "edit";
+async function submitWorkflow(workflow) {
+    const response = await fetch(`${COMFYUI_URL}/prompt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: workflow }),
+    });
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`ComfyUI error: ${response.status} - ${text}`);
+    }
+    return response.json();
 }
 
-/**
- * Converts natural-language instructions into proper SD prompts.
- *
- * "Remove the people from the image"
- *   → positive: "empty street, natural background, no people, seamless..."
- *   → negative: "person, people, human, ..."
- *
- * "Place a bicycle near the tree"
- *   → positive: "a bicycle parked near the tree, naturally integrated..."
- */
-function buildPromptPair(editPrompt, intent) {
-    const baseNeg = "blurry, duplicate, deformed, ugly, bad anatomy, bad lighting, artifacts, watermark, seam, border";
+async function waitForResult(promptId, timeout = 120000) {
+    const startTime = Date.now();
 
-    switch (intent) {
-        case "remove": {
-            // Strip action words to extract the subject ("the people", "the car", etc.)
-            const subject = editPrompt
-                .replace(/remove|delete|erase|eliminate|get rid of|clean up/gi, "")
-                .replace(/\b(from|in|the|a|an|this|image|photo|picture)\b/gi, "")
-                .trim();
+    while (Date.now() - startTime < timeout) {
+        const response = await fetch(`${COMFYUI_URL}/history/${promptId}`);
+        const history = await response.json();
 
-            return {
-                positive: `seamless background, natural scene, empty space where ${subject} was, ` +
-                          `clean continuation of surroundings, high quality, photorealistic`,
-                negative: `${subject}, ${baseNeg}`,
-            };
+        if (history[promptId]) {
+            const outputs = history[promptId].outputs;
+            for (const nodeId of Object.keys(outputs)) {
+                if (outputs[nodeId].images && outputs[nodeId].images.length > 0) {
+                    const image = outputs[nodeId].images[0];
+                    return {
+                        filename: image.filename,
+                        subfolder: image.subfolder || "",
+                        type: image.type || "output",
+                    };
+                }
+            }
+            throw new Error("No image output found in workflow results");
         }
 
-        case "add": {
-            // Keep the instruction but reframe it as a scene description
-            const subject = editPrompt
-                .replace(/add|place|put|insert|include/gi, "")
-                .replace(/\b(a|an)\b/gi, "")
-                .trim();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
 
-            return {
-                positive: `${subject}, naturally integrated into scene, consistent lighting and shadows, ` +
-                          `photorealistic, high quality, detailed`,
-                negative: baseNeg,
-            };
+    throw new Error("Workflow timed out after 120 seconds");
+}
+
+async function getResultImage(filename, subfolder, type) {
+    const params = new URLSearchParams({ filename, subfolder, type });
+    const response = await fetch(`${COMFYUI_URL}/view?${params}`);
+
+    if (!response.ok) {
+        throw new Error("Failed to fetch result image from ComfyUI");
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    const contentType = response.headers.get("content-type") || "image/png";
+
+    return `data:${contentType};base64,${base64}`;
+}
+
+async function uploadImage(base64Data, filename) {
+    const base64Clean = base64Data.replace(/^data:image\/\w+;base64,/, "");
+    const buffer = Buffer.from(base64Clean, "base64");
+
+    const formData = new FormData();
+    formData.append("image", new Blob([buffer], { type: "image/png" }), filename);
+    formData.append("overwrite", "true");
+
+    const response = await fetch(`${COMFYUI_URL}/upload/image`, {
+        method: "POST",
+        body: formData,
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to upload image: ${errorText}`);
+    }
+
+    return response.json();
+}
+
+async function analyzeImageWithFlorence(imageName) {
+    const workflow = {
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "Florence2ModelLoader",
+            inputs: {
+                model_name: "microsoft/Florence-2-base",
+                precision: "fp16",
+                attention: "sdpa"
+            }
+        },
+        "3": {
+            class_type: "Florence2Run",
+            inputs: {
+                image: ["1", 0],
+                florence2_model: ["2", 0],
+                task: "<DETAILED_CAPTION>",
+                text_input: "",
+                max_new_tokens: 1024,
+                num_beams: 3,
+                do_sample: false,
+                output_mask_select: ""
+            }
         }
+    };
 
-        case "replace": {
-            return {
-                positive: `${editPrompt}, seamlessly blended, consistent lighting, high quality, photorealistic`,
-                negative: baseNeg,
-            };
+    try {
+        const COMFYUI_URL = process.env.NEXT_PUBLIC_COMFYUI_URL || "http://10.0.62.179:8189";
+        const response = await fetch(`${COMFYUI_URL}/prompt`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: workflow }),
+        });
+        const { prompt_id } = await response.json();
+
+        // Poll for result
+        const startTime = Date.now();
+        while (Date.now() - startTime < 30000) {
+            const histRes = await fetch(`${COMFYUI_URL}/history/${prompt_id}`);
+            const history = await histRes.json();
+            if (history[prompt_id]) {
+                const outputs = history[prompt_id].outputs;
+                for (const nodeId of Object.keys(outputs)) {
+                    if (outputs[nodeId].text) {
+                        return outputs[nodeId].text[0] || "";
+                    }
+                }
+                return "";
+            }
+            await new Promise(r => setTimeout(r, 1000));
         }
-
-        default:
-            return {
-                positive: `${editPrompt}, high quality, detailed, photorealistic`,
-                negative: baseNeg,
-            };
+        return "";
+    } catch {
+        return "";
     }
 }
 
-// ─── Shared sampler config by intent ─────────────────────────────────────────
-
-function getSamplerConfig(intent) {
-    return {
-        // ComfyUI expects canonical sampler IDs (e.g. dpmpp_2m), not UI-style labels.
-        sampler_name: "dpmpp_2m",
-        scheduler: "karras",
-        steps: 30,
-        cfg: intent === "remove" ? 7.0 : 7.5,   // lower cfg → less over-saturation on fills
-        denoise: intent === "remove" ? 1.0        // full redraw for clean removal
-               : intent === "add"    ? 0.85       // mostly redraw but respect surroundings
-               : 0.9,
-        grow_mask_by: intent === "remove" ? 14 : 8,  // wider feather prevents hard edges on removal
-    };
-}
-
-// ─── Workflow 1: GroundingDINO + SAM2 (auto-segment by text) ─────────────────
-
-function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength) {
-    const intent = parseEditIntent(editPrompt);
-    const { positive, negative } = buildPromptPair(editPrompt, intent);
-    const cfg = getSamplerConfig(intent);
-    if (editStrength !== undefined) cfg.denoise = editStrength; // allow manual override
+function buildGroundingDinoWorkflow(imageName, targetObject, editPrompt, editStrength = 0.95, imageDescription = "") {
+    const contextHint = imageDescription
+        ? `same person as described: ${imageDescription.slice(0, 200)}, `
+        : "";
+    const enhancedPositive = `${editPrompt}, full outfit change, entire clothing replaced, ${contextHint}same person, same pose, same background, photorealistic, highly detailed, sharp focus, professional photo, 8k, consistent lighting`;
+    const negativePrompt = `different person, different face, different body type, blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise, artifacts`;
 
     return {
-        // ── Loaders ──────────────────────────────────────────────────────────
-        "1": { class_type: "LoadImage",
-               inputs: { image: imageName } },
-
-        "2": { class_type: "CheckpointLoaderSimple",
-               inputs: { ckpt_name: "sd-v1-5-inpainting.ckpt" } },
-
-        // ── Prompts ───────────────────────────────────────────────────────────
-        "3": { class_type: "CLIPTextEncode",
-               inputs: { text: positive, clip: ["2", 1] } },
-
-        "4": { class_type: "CLIPTextEncode",
-               inputs: { text: negative, clip: ["2", 1] } },
-
-        // ── Segmentation (GroundingDINO → SAM2) ──────────────────────────────
-        "5": { class_type: "SAM2ModelLoader (segment anything2)",
-               inputs: { model_name: "sam2_1_hiera_base_plus.pt" } },
-
-        "6": { class_type: "GroundingDinoModelLoader (segment anything2)",
-               inputs: { model_name: "GroundingDINO_SwinT_OGC (694MB)" } },
-
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["1", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "3": {
+            class_type: "CheckpointLoaderSimple",
+            inputs: { ckpt_name: "sd_xl_base_1.0_inpainting_0.1.safetensors" }
+        },
+        "4": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: enhancedPositive, clip: ["3", 1] }
+        },
+        "5": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: negativePrompt, clip: ["3", 1] }
+        },
+        "6": {
+            class_type: "SAM2ModelLoader (segment anything2)",
+            inputs: { model_name: "sam2_1_hiera_base_plus.pt" }
+        },
         "7": {
+            class_type: "GroundingDinoModelLoader (segment anything2)",
+            inputs: { model_name: "GroundingDINO_SwinT_OGC (694MB)" }
+        },
+        "8": {
             class_type: "GroundingDinoSAM2Segment (segment anything2)",
             inputs: {
-                sam_model: ["5", 0],
-                grounding_dino_model: ["6", 0],
-                image: ["1", 0],
+                sam_model: ["6", 0],
+                grounding_dino_model: ["7", 0],
+                image: ["2", 0],        // scaled image, not raw
                 prompt: targetObject,
                 threshold: 0.3,
                 keep_model_loaded: false,
             },
         },
-
-        // ── Mask feathering — softer edge for natural blending ────────────────
-        "8": { class_type: "GrowMask",
-               inputs: { mask: ["7", 1], expand: cfg.grow_mask_by, tapered_corners: true } },
-
-        // ── Encode for inpainting ─────────────────────────────────────────────
         "9": {
             class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["1", 0], vae: ["2", 2], mask: ["8", 0], grow_mask_by: 0 },
+            inputs: {
+                pixels: ["2", 0],       // scaled image
+                vae: ["3", 2],
+                mask: ["8", 1],         // SAM2 mask output
+                grow_mask_by: 24,   // was 8, now 24 for full outfit coverage
+            },
         },
-
-        // ── First pass: main inpaint ──────────────────────────────────────────
         "10": {
             class_type: "KSampler",
             inputs: {
-                model: ["2", 0],
-                positive: ["3", 0],
-                negative: ["4", 0],
+                model: ["3", 0],
+                positive: ["4", 0],
+                negative: ["5", 0],
                 latent_image: ["9", 0],
-                seed: Math.floor(Math.random() * 1_000_000_000),
-                steps: cfg.steps,
-                cfg: cfg.cfg,
-                sampler_name: cfg.sampler_name,
-                scheduler: cfg.scheduler,
-                denoise: cfg.denoise,
+                seed: Math.floor(Math.random() * 1000000000),
+                steps: 40,
+                cfg: 7.0,
+                sampler_name: "dpmpp_2m",
+                scheduler: "karras",
+                denoise: editStrength,
             },
         },
-
-        // ── Decode first pass ─────────────────────────────────────────────────
-        "11": { class_type: "VAEDecode",
-                inputs: { samples: ["10", 0], vae: ["2", 2] } },
-
-        // ── Composite first-pass result onto original ─────────────────────────
+        "11": {
+            class_type: "VAEDecode",
+            inputs: { samples: ["10", 0], vae: ["3", 2] }
+        },
         "12": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["1", 0], source: ["11", 0], mask: ["8", 0],
-                      x: 0, y: 0, resize_source: false },
+            class_type: "SaveImage",
+            inputs: { images: ["11", 0], filename_prefix: "pixxel_final" }
         },
-
-        // ── Second pass: low-denoise refinement for seamless blending ─────────
-        "13": {
-            class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["12", 0], vae: ["2", 2], mask: ["8", 0], grow_mask_by: 0 },
-        },
-
-        "14": {
-            class_type: "KSampler",
-            inputs: {
-                model: ["2", 0],
-                positive: ["3", 0],
-                negative: ["4", 0],
-                latent_image: ["13", 0],
-                seed: Math.floor(Math.random() * 1_000_000_000),
-                steps: 20,
-                cfg: 5.0,              // low cfg on refinement pass = subtle, no over-cooking
-                sampler_name: cfg.sampler_name,
-                scheduler: cfg.scheduler,
-                denoise: 0.3,          // only 30% redraw to smooth boundaries
-            },
-        },
-
-        "15": { class_type: "VAEDecode",
-                inputs: { samples: ["14", 0], vae: ["2", 2] } },
-
-        // ── Final composite ───────────────────────────────────────────────────
-        "16": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["12", 0], source: ["15", 0], mask: ["8", 0],
-                      x: 0, y: 0, resize_source: false },
-        },
-
-        "17": { class_type: "SaveImage",
-                inputs: { images: ["16", 0], filename_prefix: "pixxel_final" } },
     };
 }
 
-// ─── Workflow 2: Manual brush mask ───────────────────────────────────────────
-
-function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength) {
-    const intent = parseEditIntent(editPrompt);
-    const { positive, negative } = buildPromptPair(editPrompt, intent);
-    const cfg = getSamplerConfig(intent);
-    if (editStrength !== undefined) cfg.denoise = editStrength;
+function buildManualBrushWorkflow(imageName, maskName, editPrompt, editStrength = 0.95, imageDescription = "") {
+    const contextHint = imageDescription
+        ? `same person as described: ${imageDescription.slice(0, 200)}, `
+        : "";
+    const enhancedPositive = `${editPrompt}, full outfit change, entire clothing replaced, ${contextHint}same person, same pose, same background, photorealistic, highly detailed, sharp focus, professional photo, 8k, consistent lighting`;
+    const negativePrompt = `different person, different face, different body type, blurry, deformed, ugly, bad anatomy, bad lighting, duplicate, watermark, text, oversaturated, unrealistic, cartoon, painting, low quality, noise, artifacts`;
 
     return {
-        // ── Loaders ──────────────────────────────────────────────────────────
-        "1": { class_type: "LoadImage",
-               inputs: { image: imageName } },
-
-        "2": { class_type: "LoadImage",
-               inputs: { image: maskName } },
-
-        "3": { class_type: "ImageToMask",
-               inputs: { image: ["2", 0], channel: "red" } },
-
-        "4": { class_type: "CheckpointLoaderSimple",
-               inputs: { ckpt_name: "sd-v1-5-inpainting.ckpt" } },
-
-        // ── Prompts ───────────────────────────────────────────────────────────
-        "5": { class_type: "CLIPTextEncode",
-               inputs: { text: positive, clip: ["4", 1] } },
-
-        "6": { class_type: "CLIPTextEncode",
-               inputs: { text: negative, clip: ["4", 1] } },
-
-        // ── Mask feathering ───────────────────────────────────────────────────
-        "7": { class_type: "GrowMask",
-               inputs: { mask: ["3", 0], expand: cfg.grow_mask_by, tapered_corners: true } },
-
-        // ── Encode for inpainting ─────────────────────────────────────────────
+        "1": {
+            class_type: "LoadImage",
+            inputs: { image: imageName }
+        },
+        "2": {
+            class_type: "LoadImage",
+            inputs: { image: maskName }
+        },
+        "3": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["1", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "4": {
+            class_type: "ImageScale",
+            inputs: {
+                image: ["2", 0],
+                width: 1024,
+                height: 1024,
+                upscale_method: "lanczos",
+                crop: "disabled"
+            }
+        },
+        "5": {
+            class_type: "ImageToMask",
+            inputs: { image: ["4", 0], channel: "red" }
+        },
+        "6": {
+            class_type: "CheckpointLoaderSimple",
+            inputs: { ckpt_name: "sd_xl_base_1.0_inpainting_0.1.safetensors" }
+        },
+        "7": {
+            class_type: "CLIPTextEncode",
+            inputs: { text: enhancedPositive, clip: ["6", 1] }
+        },
         "8": {
-            class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["1", 0], vae: ["4", 2], mask: ["7", 0], grow_mask_by: 0 },
+            class_type: "CLIPTextEncode",
+            inputs: { text: negativePrompt, clip: ["6", 1] }
         },
-
-        // ── First pass ────────────────────────────────────────────────────────
         "9": {
-            class_type: "KSampler",
+            class_type: "VAEEncode",
             inputs: {
-                model: ["4", 0],
-                positive: ["5", 0],
-                negative: ["6", 0],
-                latent_image: ["8", 0],
-                seed: Math.floor(Math.random() * 1_000_000_000),
-                steps: cfg.steps,
-                cfg: cfg.cfg,
-                sampler_name: cfg.sampler_name,
-                scheduler: cfg.scheduler,
-                denoise: cfg.denoise,
+                pixels: ["3", 0],   // scaled image (use ["2",0] for GroundingDino workflow)
+                vae: ["6", 2],      // (use ["3",2] for GroundingDino workflow)
             },
         },
-
-        "10": { class_type: "VAEDecode",
-                inputs: { samples: ["9", 0], vae: ["4", 2] } },
-
+        "9b": {
+            class_type: "SetLatentNoiseMask",
+            inputs: {
+                samples: ["9", 0],
+                mask: ["5", 0],     // your mask node output (use ["8",1] for GroundingDino workflow)
+            },
+        },
+        "10": {
+            class_type: "KSampler",
+            inputs: {
+                model: ["6", 0],
+                positive: ["7", 0],
+                negative: ["8", 0],
+                latent_image: ["9b", 0],
+                seed: Math.floor(Math.random() * 1000000000),
+                steps: 40,
+                cfg: 7.0,
+                sampler_name: "dpmpp_2m",
+                scheduler: "karras",
+                denoise: editStrength,
+            },
+        },
         "11": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["1", 0], source: ["10", 0], mask: ["7", 0],
-                      x: 0, y: 0, resize_source: false },
+            class_type: "VAEDecode",
+            inputs: { samples: ["10", 0], vae: ["6", 2] }
         },
-
-        // ── Second pass: refinement ───────────────────────────────────────────
         "12": {
-            class_type: "VAEEncodeForInpaint",
-            inputs: { pixels: ["11", 0], vae: ["4", 2], mask: ["7", 0], grow_mask_by: 0 },
+            class_type: "SaveImage",
+            inputs: { images: ["11", 0], filename_prefix: "pixxel_final" }
         },
-
-        "13": {
-            class_type: "KSampler",
-            inputs: {
-                model: ["4", 0],
-                positive: ["5", 0],
-                negative: ["6", 0],
-                latent_image: ["12", 0],
-                seed: Math.floor(Math.random() * 1_000_000_000),
-                steps: 20,
-                cfg: 5.0,
-                sampler_name: cfg.sampler_name,
-                scheduler: cfg.scheduler,
-                denoise: 0.3,
-            },
-        },
-
-        "14": { class_type: "VAEDecode",
-                inputs: { samples: ["13", 0], vae: ["4", 2] } },
-
-        "15": {
-            class_type: "ImageCompositeMasked",
-            inputs: { destination: ["11", 0], source: ["14", 0], mask: ["7", 0],
-                      x: 0, y: 0, resize_source: false },
-        },
-
-        "16": { class_type: "SaveImage",
-                inputs: { images: ["15", 0], filename_prefix: "pixxel_final" } },
     };
 }
 
@@ -318,14 +331,23 @@ export async function POST(request) {
         const timestamp = Date.now();
         const imageResult = await uploadImage(image, `pixxel_input_${timestamp}.png`);
 
+        // Auto-analyze image for context-aware prompting
+        const imageDescription = await analyzeImageWithFlorence(imageResult.name);
+
         let workflow;
         if (mode === "auto") {
             if (!targetObject) return NextResponse.json({ error: "targetObject required for auto mode" }, { status: 400 });
-            workflow = buildGroundingDinoWorkflow(imageResult.name, targetObject, editPrompt, editStrength || 1.0);
+            workflow = buildGroundingDinoWorkflow(
+                imageResult.name, targetObject, editPrompt,
+                editStrength || 0.95, imageDescription
+            );
         } else {
             if (!mask) return NextResponse.json({ error: "mask required for brush mode" }, { status: 400 });
             const maskResult = await uploadImage(mask, `pixxel_mask_${timestamp}.png`);
-            workflow = buildManualBrushWorkflow(imageResult.name, maskResult.name, editPrompt, editStrength || 1.0);
+            workflow = buildManualBrushWorkflow(
+                imageResult.name, maskResult.name, editPrompt,
+                editStrength || 0.95, imageDescription
+            );
         }
 
         const { prompt_id } = await submitWorkflow(workflow);
